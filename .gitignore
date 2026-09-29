@@ -1,0 +1,19 @@
+# Dataset, caches and generated outputs
+data/
+*.npy
+*.dat
+*.hea
+artifacts/
+*.pth
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# System / editors
+.DS_Store
+.vscode/
+.idea/

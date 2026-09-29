@@ -1,0 +1,63 @@
+# PTB-XL 12-lead pipeline: class balancing -> denoising -> 1D ViT
+
+data:
+  raw_dir: "data/raw/ptbxl"            # symlink to the PTB-XL v1.0.3 download
+  database_csv: "data/raw/ptbxl/ptbxl_database.csv"
+  scp_csv: "data/raw/ptbxl/scp_statements.csv"
+  processed_dir: "data/processed"
+  sampling_rate: 500
+  seq_len: 5000                        # 10 s at 500 Hz
+  leads: ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+
+split:
+  train_folds: [1, 2, 3, 4, 5, 6, 7, 8]
+  val_folds: [9]
+  test_folds: [10]
+
+imbalance:
+  method: "ml_ros"                     # multi-label random oversampling (train folds only)
+  target_ir: 1.1                       # stop once every label's IRLbl <= this
+  max_growth: 1.0                      # never add more than 100% extra training records
+  tune_thresholds: true                # per-class decision thresholds chosen on validation
+  seed: 42
+
+denoising:
+  highpass_cutoff: 0.5                 # Hz, baseline wander
+  lowpass_cutoff: 40.0                 # Hz, EMG / muscle noise
+  notch_freq: 50.0                     # Hz, powerline hum
+  notch_q: 30.0
+  filter_order: 5
+  wavelet_name: "sym8"
+  wavelet_level: 5                     # 500 / 2^5 = 15.6 Hz approximation band
+  normalize: "zscore"
+
+augmentation:                          # applied on-the-fly so oversampled copies differ
+  min_scale: 0.85
+  max_scale: 1.15
+  max_shift: 250                       # samples (0.5 s)
+  cutout_holes: 2
+  cutout_max_len: 250
+  p: 0.5
+
+model:
+  patch_size: 100                      # 0.2 s
+  patch_stride: 50                     # 50% overlap -> 99 tokens
+  embed_dim: 192
+  depth: 6
+  num_heads: 6
+  mlp_ratio: 2.0
+  dropout: 0.1
+
+training:
+  batch_size: 64
+  epochs: 40
+  learning_rate: 0.0005
+  weight_decay: 0.05
+  warmup_epochs: 2
+  early_stopping_patience: 8
+  seed: 42
+  device: "auto"                       # auto -> mps / cuda / cpu
+
+output:
+  artifacts_dir: "artifacts"
+  results_dir: "docs/results"
