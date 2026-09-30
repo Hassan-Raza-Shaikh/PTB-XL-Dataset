@@ -8,10 +8,13 @@ imbalance measures from Charte et al. (2015):
     IRLbl(c) = max_k count(k) / count(c)      (1.0 for the majority label)
     MeanIR   = mean_c IRLbl(c)
 
-and a greedy variant of ML-ROS (multi-label random oversampling): repeatedly clone
-a training record that carries the label with the highest IRLbl. Records that also
-carry the majority label are avoided when possible, so balancing a minority label
-does not inflate the majority at the same time.
+Balancing is augmentation-based oversampling. Source records are chosen the way
+ML-ROS (multi-label random oversampling) would choose them: repeatedly pick a
+training record carrying the label with the highest IRLbl, avoiding records that
+also carry the majority label so balancing a minority label does not inflate the
+majority. Unlike plain ML-ROS, a pick is not trained on as a duplicate. It becomes
+a *synthetic* sample that the step-3 augmenter regenerates from its source with a
+fresh random 1D augmentation every time it is drawn (see src/augmentation.py).
 """
 
 import numpy as np
@@ -31,11 +34,12 @@ def mean_ir(y):
     return float(irlbl(y).mean())
 
 
-def multilabel_random_oversample(y, target_ir=1.1, max_growth=1.0, seed=42):
+def select_synthetic_sources(y, target_ir=1.1, max_growth=1.0, seed=42):
     """
-    Returns an array of row indices into `y` (original rows first, then clones)
-    whose label counts have every IRLbl <= target_ir, or which has grown by
-    max_growth * len(y) extra rows, whichever comes first.
+    Returns (rows, is_synthetic). `rows` indexes into `y`: all original rows first,
+    then the source row of each synthetic sample. Synthetic samples are added until
+    every IRLbl <= target_ir, or until max_growth * len(y) have been added,
+    whichever comes first.
     """
     rng = np.random.default_rng(seed)
     n, num_labels = y.shape
@@ -51,17 +55,19 @@ def multilabel_random_oversample(y, target_ir=1.1, max_growth=1.0, seed=42):
         pools.append(pool)
 
     budget = int(max_growth * n)
-    clones = []
-    while len(clones) < budget:
+    sources = []
+    while len(sources) < budget:
         ratios = counts.max() / np.maximum(counts, 1.0)
         if ratios.max() <= target_ir:
             break
         c = int(ratios.argmax())
         i = int(rng.choice(pools[c]))
-        clones.append(i)
+        sources.append(i)
         counts += y[i]
 
-    return np.concatenate([np.arange(n), np.asarray(clones, dtype=np.int64)])
+    rows = np.concatenate([np.arange(n), np.asarray(sources, dtype=np.int64)])
+    is_synthetic = np.arange(len(rows)) >= n
+    return rows, is_synthetic
 
 
 def tune_thresholds(y_true, y_prob, grid=np.linspace(0.05, 0.95, 91)):

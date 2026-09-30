@@ -1,8 +1,9 @@
 """
 STEP 3: Train and evaluate the 1D ViT on all 12 denoised leads (500 Hz).
 
-  - Training set  : balanced ecg_ids from step 1, read from the step 2 cache,
-                    with on-the-fly batch augmentation (scale, shift, cutout)
+  - Training set  : real + synthetic samples planned in step 1, read from the
+                    step 2 cache; synthetic samples are regenerated from their
+                    source record with a fresh 1D augmentation every epoch
   - Validation    : fold 9, used for checkpoint selection, early stopping and
                     per-class threshold tuning
   - Test          : fold 10, evaluated once with the best checkpoint
@@ -53,11 +54,15 @@ def pick_device(name):
     return torch.device("cpu")
 
 
-def iterate_batches(X, y, rows, batch_size, shuffle):
-    order = np.random.permutation(rows) if shuffle else rows
+def iterate_batches(X, y, rows, batch_size, shuffle, synthetic=None):
+    """Yields (signals, labels, is_synthetic) batches for the given cache rows."""
+    if synthetic is None:
+        synthetic = np.zeros(len(rows), dtype=bool)
+    order = np.random.permutation(len(rows)) if shuffle else np.arange(len(rows))
     for start in range(0, len(order), batch_size):
-        idx = order[start : start + batch_size]
-        yield torch.from_numpy(X[idx].astype(np.float32)), torch.from_numpy(y[idx])
+        pos = order[start : start + batch_size]
+        idx = rows[pos]
+        yield torch.from_numpy(X[idx].astype(np.float32)), torch.from_numpy(y[idx]), torch.from_numpy(synthetic[pos])
 
 
 def warmup_cosine(optimizer, warmup_steps, total_steps):
@@ -69,13 +74,14 @@ def warmup_cosine(optimizer, warmup_steps, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
-def train_epoch(model, X, y, rows, batch_size, criterion, optimizer, scheduler, augmenter, device):
+def train_epoch(model, X, y, rows, synthetic, batch_size, criterion, optimizer, scheduler, augmenter, device):
     model.train()
     total = 0.0
     n_batches = math.ceil(len(rows) / batch_size)
-    for xb, yb in tqdm(iterate_batches(X, y, rows, batch_size, shuffle=True), total=n_batches, desc="train", leave=False):
+    batches = iterate_batches(X, y, rows, batch_size, shuffle=True, synthetic=synthetic)
+    for xb, yb, sb in tqdm(batches, total=n_batches, desc="train", leave=False):
         xb, yb = xb.to(device), yb.to(device)
-        xb = augmenter(xb)
+        xb = augmenter(xb, synthetic=sb.to(device))
         optimizer.zero_grad(set_to_none=True)
         loss = criterion(model(xb), yb)
         loss.backward()
@@ -90,7 +96,7 @@ def train_epoch(model, X, y, rows, batch_size, criterion, optimizer, scheduler, 
 def predict(model, X, y, rows, batch_size, criterion, device):
     model.eval()
     total, probs = 0.0, []
-    for xb, yb in iterate_batches(X, y, rows, batch_size, shuffle=False):
+    for xb, yb, _ in iterate_batches(X, y, rows, batch_size, shuffle=False):
         xb, yb = xb.to(device), yb.to(device)
         logits = model(xb)
         total += criterion(logits, yb).item() * len(yb)
@@ -128,6 +134,7 @@ def main():
 
     row_of = pd.Series(np.arange(len(df)), index=df.index)
     train_rows = row_of.loc[np.load(processed_path(config, "balanced_train_ecg_ids.npy"))].values
+    train_synthetic = np.load(processed_path(config, "balanced_train_is_synthetic.npy"))
     val_rows = np.where(val_mask)[0]
     test_rows = np.where(test_mask)[0]
 
@@ -135,7 +142,7 @@ def main():
     print("STEP 3: 1D ViT ON ALL 12 DENOISED LEADS @ 500 Hz")
     print("=" * 72)
     print(f"Device: {device}")
-    print(f"Train (balanced) = {len(train_rows)} | Val = {len(val_rows)} | Test = {len(test_rows)}")
+    print(f"Train = {len(train_rows)} ({int(train_synthetic.sum())} synthetic) | Val = {len(val_rows)} | Test = {len(test_rows)}")
 
     model = ECGViT1D.from_config(config, num_classes=len(SUPERCLASSES)).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -159,7 +166,7 @@ def main():
     history = {"train_loss": [], "val_loss": [], "val_auc": []}
     best_auc, stale = -1.0, 0
     for epoch in range(1, epochs + 1):
-        t_loss = train_epoch(model, X, y_all, train_rows, batch_size, criterion, optimizer, scheduler, augmenter, device)
+        t_loss = train_epoch(model, X, y_all, train_rows, train_synthetic, batch_size, criterion, optimizer, scheduler, augmenter, device)
         v_loss, v_prob = predict(model, X, y_all, val_rows, batch_size, criterion, device)
         v_auc = macro_auc(y_all[val_rows], v_prob)
         history["train_loss"].append(t_loss)

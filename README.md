@@ -4,7 +4,7 @@ Multi-label classification of the 5 PTB-XL diagnostic superclasses (NORM, MI, ST
 from **all 12 leads at 500 Hz** (5,000 samples per lead). The pipeline runs in three steps,
 in this order:
 
-1. **Resolve class imbalance** (multi-label random oversampling on the training folds)
+1. **Resolve class imbalance** (synthetic minority samples via 1D data augmentation, training folds only)
 2. **Denoise** all 12 leads (Butterworth HP/LP, 50 Hz notch, sym8 wavelet, z-score)
 3. **Train a 1D Vision Transformer** on the balanced, denoised 12-lead signals
 
@@ -32,33 +32,53 @@ The official PTB-XL stratified folds: **train = folds 1–8, validation = fold 9
 Only the training folds are resampled. Validation and test keep the real class
 distribution, so the reported metrics are honest.
 
-## Step 1: Class imbalance
+## Step 1: Class imbalance (1D augmentation-based oversampling)
 
 PTB-XL is **multi-label**: 4,068 records have two superclasses and 1,076 have three or more.
 Single-label tools such as SMOTE or a class-balanced sampler don't apply directly.
+
+Plain random oversampling duplicates minority records, and the model memorises those few
+records, so it overfits. Here every added minority sample is instead a **synthetic 1D-augmented
+ECG**, regenerated from its source record with fresh random parameters **every epoch**. So no
+two epochs, and no two synthetic samples, see the same signal. Synthetic samples always get these
+transforms (per-transform p = 1.0); real records get them with p = 0.5
+([`src/augmentation.py`](src/augmentation.py)):
+
+| Transform | Range | Mimics |
+|---|---|---|
+| Amplitude scaling (same gain on all 12 leads) | ×0.85 – 1.15 | electrode contact / body habitus |
+| Time stretch | ×0.9 – 1.1 | heart-rate / cycle-length variation |
+| Circular time shift | ±0.5 s | where the 10 s window starts |
+| Gaussian noise | σ = 0.02 (z-score units) | residual sensor noise; regulariser |
+| Temporal cutout (2 holes) | 10 – 250 samples | brief electrode dropout |
+
+Synthetic signals are generated on the fly rather than saved to disk. A saved augmented copy
+would be the same signal every epoch, which brings back the duplicate-memorisation problem.
+It would also add another ~2.6 GB.
+
 Training-fold label counts:
 
 | | NORM | MI | STTC | CD | HYP | MeanIR |
 |---|---:|---:|---:|---:|---:|---:|
 | Before | 7,596 | 4,379 | 4,186 | 3,907 | 2,119 | 2.02 |
-| After ML-ROS | 7,596 | 6,907 | 7,264 | 6,908 | 6,906 | 1.07 |
+| After (real + synthetic) | 7,596 | 6,907 | 7,264 | 6,908 | 6,906 | 1.07 |
 
-(17,418 → 23,962 training records.)
+(17,418 real + 6,544 synthetic = 23,962 training samples.)
 
-Method ([`src/imbalance.py`](src/imbalance.py)):
+How many synthetic samples, and from which records ([`src/imbalance.py`](src/imbalance.py)):
 
 - The imbalance ratio per label is `IRLbl(c) = max_count / count(c)`, and `MeanIR` is its mean (Charte et al., 2015).
-- **Greedy ML-ROS**: repeatedly clone a training record that carries the label with the highest
-  IRLbl. Records that also carry the majority label (NORM) are avoided, so balancing HYP doesn't
-  inflate NORM. It stops when every IRLbl ≤ `target_ir` (1.1) or the set has grown by `max_growth`.
-- Clones are never exact repeats in training: step 3 applies random amplitude scaling, time
-  shift, and cutout to every batch.
+- Repeatedly add a synthetic sample generated from a training record that carries the label
+  with the highest IRLbl. This is the ML-ROS selection rule. Records that also carry the majority
+  label (NORM) are avoided, so balancing HYP doesn't inflate NORM. It stops when every
+  IRLbl ≤ `target_ir` (1.1) or `max_growth` is reached.
 - **Per-class decision thresholds** are tuned on validation to maximise F1. They are then applied
   once to test. The test metrics are reported with both 0.5 and tuned thresholds.
 
-Oversampling happens at the index level (`balanced_train_ecg_ids.npy` lists cloned ids more than once).
-Denoising is deterministic per record, so denoising each unique record once and reading it
-through the balanced index is equivalent to denoising the oversampled set.
+Step 1 saves only the plan: `balanced_train_ecg_ids.npy` (source record of every training sample)
+and `balanced_train_is_synthetic.npy`. Denoising is deterministic per record, so step 2 denoises
+each real record once. Step 3 then augments the denoised source whenever a synthetic sample is
+drawn.
 
 ## Step 2: Denoising (all 12 leads, 500 Hz)
 
@@ -98,8 +118,8 @@ Training setup:
 - Loss: `BCEWithLogitsLoss`. There is no `pos_weight`, because balancing is already done in step 1.
 - Optimizer: AdamW (lr 5e-4, weight decay 0.05), 2-epoch linear warmup, then cosine decay.
 - Up to 40 epochs, with early stopping on validation macro ROC-AUC (patience 8).
-- Batch augmentation on the device: amplitude ×[0.85, 1.15], circular shift ±0.5 s, and 2 cutouts
-  up to 0.5 s. No added noise, since the input was just denoised.
+- 1D augmentation on the device every batch (see step 1). Synthetic samples always get it;
+  real records get each transform with p = 0.5.
 
 ## Outputs
 
@@ -131,12 +151,12 @@ balancing and threshold tuning target exactly that class.
 configs/config.yaml               all paths & hyperparameters
 src/
   00_download_dataset.py          step 0: fetch PTB-XL
-  01_resolve_class_imbalance.py   step 1: ML-ROS on train folds
+  01_resolve_class_imbalance.py   step 1: plan synthetic minority samples
   02_denoise_12_leads.py          step 2: denoise + cache + quality checks
   03_train_vit_12_leads.py        step 3: train / tune thresholds / evaluate ViT
   data.py                         metadata, superclass labels, fold splits
-  imbalance.py                    IRLbl / MeanIR, ML-ROS, threshold tuning
+  imbalance.py                    IRLbl / MeanIR, synthetic-sample selection, threshold tuning
   denoising.py                    ECGDenoiser
-  augmentation.py                 batched on-device augmentation
+  augmentation.py                 batched on-device 1D augmentation (generates synthetic samples)
   vit.py                          ECGViT1D
 ```
